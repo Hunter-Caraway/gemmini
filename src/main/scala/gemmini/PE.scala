@@ -28,15 +28,23 @@ class MacUnit[T <: Data](inputType: T, weightType: T, cType: T, dType: T) (impli
   * A PE implementing a MAC operation. Configured as fully combinational when integrated into a Mesh.
   * @param width Data width of operands
   */
-class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: Dataflow.Value, max_simultaneous_matmuls: Int)
+class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: Dataflow.Value, max_simultaneous_matmuls: Int,
+                    nm: Option[(Int, Int)] = None) // changed: added n:m option
                    (implicit ev: Arithmetic[T]) extends Module { // Debugging variables
   import ev._
 
+  // changed: with n:m on, a is the whole group of m activations and the pe picks one
+  val nm_idx_bits = nm.map { case (_, m) => log2Up(m) max 1 }.getOrElse(1)
+  val aType: Data = nm match {
+    case Some((_, m)) => Vec(m, inputType)
+    case None => inputType
+  }
+
   val io = IO(new Bundle {
-    val in_a = Input(inputType)
+    val in_a = Input(aType)
     val in_b = Input(outputType)
     val in_d = Input(outputType)
-    val out_a = Output(inputType)
+    val out_a = Output(aType)
     val out_b = Output(outputType)
     val out_c = Output(outputType)
 
@@ -53,6 +61,10 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
     val out_valid = Output(Bool())
 
     val bad_dataflow = Output(Bool())
+
+    // changed: weight index, shifts down the column right next to in_d
+    val in_meta = nm.map(_ => Input(UInt(nm_idx_bits.W)))
+    val out_meta = nm.map(_ => Output(UInt(nm_idx_bits.W)))
   })
 
   val cType = if (df == Dataflow.WS) inputType else accType
@@ -64,19 +76,32 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
   val mac_unit = Module(new MacUnit(inputType, weightType,
     if (df == Dataflow.WS) outputType else accType, outputType))
 
-  val a  = io.in_a
   val b  = io.in_b
   val d  = io.in_d
   val c1 = Reg(cType)
   val c2 = Reg(cType)
   val dataflow = io.in_control.dataflow
   val prop  = io.in_control.propagate
+
+  // changed: m1/m2 hold the index for whatever weight is sitting in c1/c2
+  val m1 = nm.map(_ => Reg(UInt(nm_idx_bits.W)))
+  val m2 = nm.map(_ => Reg(UInt(nm_idx_bits.W)))
+
+  // changed: pick the activation, ws uses the index of the weight we're multiplying with
+  // (c2 when propagating, c1 otherwise), os just takes slot 0 like a dense pe
+  val a: T = nm match {
+    case Some(_) =>
+      val cur_meta = Mux(prop === 1.U, m2.get, m1.get)
+      val sel = Mux(dataflow === Dataflow.WS.id.U(1.W), cur_meta, 0.U)
+      io.in_a.asInstanceOf[Vec[T]](sel)
+    case None => io.in_a.asInstanceOf[T]
+  }
   val shift = io.in_control.shift
   val id = io.in_id
   val last = io.in_last
   val valid = io.in_valid
 
-  io.out_a := a
+  io.out_a := io.in_a // changed: pass the whole group along, not just the picked one
   io.out_control.dataflow := dataflow
   io.out_control.propagate := prop
   io.out_control.shift := shift
@@ -99,6 +124,7 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
   val PROPAGATE = 1.U(1.W)
 
   io.bad_dataflow := false.B
+  io.out_meta.foreach(_ := m1.get) // changed: default, overwritten in ws below
   when ((df == Dataflow.OS).B || ((df == Dataflow.BOTH).B && dataflow === OUTPUT_STATIONARY)) {
     when(prop === PROPAGATE) {
       io.out_c := (c1 >> shift_offset).clippedToWidthOf(outputType)
@@ -122,12 +148,18 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
       mac_unit.io.in_c := b
       io.out_b := mac_unit.io.out_d
       c1 := d
+      // changed: index follows its weight down the column
+      m1.foreach(_ := io.in_meta.get)
+      io.out_meta.foreach(_ := m1.get)
     }.otherwise {
       io.out_c := c2
       mac_unit.io.in_b := c1.asTypeOf(weightType)
       mac_unit.io.in_c := b
       io.out_b := mac_unit.io.out_d
       c2 := d
+      // changed: same thing for the other buffer
+      m2.foreach(_ := io.in_meta.get)
+      io.out_meta.foreach(_ := m2.get)
     }
   }.otherwise {
     io.bad_dataflow := true.B
@@ -141,6 +173,8 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
   when (!valid) {
     c1 := c1
     c2 := c2
+    m1.foreach(r => r := r) // changed: hold the indexes too
+    m2.foreach(r => r := r)
     mac_unit.io.in_b := DontCare
     mac_unit.io.in_c := DontCare
   }

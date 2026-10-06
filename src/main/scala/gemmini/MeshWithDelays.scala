@@ -13,6 +13,7 @@ class MeshWithDelaysReq[T <: Data: Arithmetic, TagT <: TagQueueTag with Data](ac
   val total_rows = UInt(log2Up(block_size+1).W)
   val tag = tagType
   val flush = UInt(2.W) // TODO magic number
+  val nm_sparse = Bool() // changed: this request runs in n:m sparse mode
 
 }
 
@@ -33,8 +34,11 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   (val inputType: T,  val weightType: T, val outputType: T, accType: T,
    tagType: U, df: Dataflow.Value, tree_reduction: Boolean, tile_latency: Int, output_delay: Int,
    tileRows: Int, tileColumns: Int, meshRows: Int, meshColumns: Int,
-   leftBanks: Int, upBanks: Int, outBanks: Int = 1, n_simultaneous_matmuls: Int = -1)
+   leftBanks: Int, upBanks: Int, outBanks: Int = 1, n_simultaneous_matmuls: Int = -1,
+   nm: Option[(Int, Int)] = None) // changed: added n:m option
   extends Module {
+
+  val nm_idx_bits = nm.map { case (_, m) => log2Up(m) max 1 }.getOrElse(1) // changed: added
 
   val A_TYPE = Vec(meshRows, Vec(tileRows, inputType))
   val B_TYPE = Vec(meshColumns, Vec(tileColumns, weightType)) // TODO should this be weightType, inputType, or something like max(inputType, weightType)?
@@ -65,6 +69,9 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
     val resp = Valid(new MeshWithDelaysResp(outputType, meshColumns, tileColumns, block_size, tagType.cloneType))
 
     val tags_in_progress = Output(Vec(tagqlen, tagType))
+
+    // changed: weight indexes, sampled together with d
+    val d_meta = nm.map(_ => Input(Vec(meshColumns, Vec(tileColumns, UInt(nm_idx_bits.W)))))
   })
 
   def shifted[T <: Data](x: Vec[Vec[T]], banks: Int, reverse: Boolean = false): Seq[Vec[T]] = {
@@ -100,6 +107,7 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   val a_buf = RegEnable(io.a.bits, io.a.fire)
   val b_buf = RegEnable(io.b.bits, io.b.fire)
   val d_buf = RegEnable(io.d.bits, io.d.fire)
+  val d_meta_buf = io.d_meta.map(m => RegEnable(m, io.d.fire)) // changed: added
 
   val a_written = RegInit(false.B)
   val b_written = RegInit(false.B)
@@ -164,7 +172,7 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   val transposer_out = VecInit(transposer.io.outCol.bits.grouped(tileRows).map(t => VecInit(t)).toSeq)
 
   // Wire up mesh's IO to this module's IO
-  val mesh = Module(new Mesh(inputType, weightType, outputType, accType, df, tree_reduction, tile_latency, max_simultaneous_matmuls, output_delay, tileRows, tileColumns, meshRows, meshColumns))
+  val mesh = Module(new Mesh(inputType, weightType, outputType, accType, df, tree_reduction, tile_latency, max_simultaneous_matmuls, output_delay, tileRows, tileColumns, meshRows, meshColumns, nm))
 
   // TODO wire only to *_buf here, instead of io.*.bits
   val a_shifter_in = WireInit(Mux(a_is_from_transposer, transposer_out.asTypeOf(A_TYPE), a_buf))
@@ -172,8 +180,35 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   val d_shifter_in = WireInit(Mux(d_is_from_transposer,
     VecInit(transposer_out.flatten.reverse.grouped(tileRows).map(VecInit(_)).toSeq).asTypeOf(D_TYPE), d_buf))
 
-  mesh.io.in_a := shifted(a_shifter_in, leftBanks)
-  mesh.io.in_b := shifted(b_shifter_in, upBanks)
+  nm match {
+    case Some((n, m)) =>
+      // changed: n:m sparse mode
+      // the dense activation row is 2*block_size wide: a gives the low half, b (the bias slot) the high half.
+      // array row r holds a squashed weight from group r/n so it needs the m activations of that group.
+      // in dense mode each row just gets its own activation in slot 0 and the index stays 0
+      val sparse = req.bits.nm_sparse
+      val zero_a = 0.U.asTypeOf(inputType)
+      val a_flat = a_shifter_in.flatten
+      val dense_row = a_flat ++ b_shifter_in.flatten.map(_.asTypeOf(inputType))
+      val a_groups = (0 until block_size).map { r =>
+        val g = r / n
+        val sparse_grp = VecInit((0 until m).map(i => dense_row(g * m + i)))
+        val dense_grp = VecInit(a_flat(r) +: Seq.fill(m - 1)(zero_a))
+        Mux(sparse, sparse_grp, dense_grp)
+      }
+      val a_mesh_in = VecInit(a_groups.grouped(tileRows).map(VecInit(_)).toSeq)
+      mesh.io.in_a := VecInit(shifted(a_mesh_in, leftBanks))
+
+      // b is activations in sparse mode, so the partial sums start at 0
+      mesh.io.in_b := shifted(Mux(sparse, 0.U.asTypeOf(b_shifter_in), b_shifter_in), upBanks)
+
+      val meta_in = Mux(sparse, d_meta_buf.get, 0.U.asTypeOf(d_meta_buf.get))
+      mesh.io.in_meta.get := shifted(meta_in, upBanks)
+
+    case None =>
+      mesh.io.in_a := VecInit(shifted(a_shifter_in, leftBanks))
+      mesh.io.in_b := shifted(b_shifter_in, upBanks)
+  }
   mesh.io.in_d := shifted(d_shifter_in, upBanks)
 
   mesh.io.in_control.zipWithIndex.foreach { case (ss, i) =>

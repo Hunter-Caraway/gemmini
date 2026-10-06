@@ -241,6 +241,10 @@ object GemminiConfigs {
     meshRows=32, meshColumns=32
   )
 
+  // changed: default config plus n:m sparse weight stationary support (2:4)
+  val nmSparseConfig = defaultConfig.copy(nm_sparsity = Some((2, 4)))
+  val nm48SparseConfig = defaultConfig.copy(nm_sparsity = Some((4, 8)))
+
   val leanConfig = defaultConfig.copy(dataflow=Dataflow.WS, max_in_flight_mem_reqs = 64, acc_read_full_width = false, ex_read_from_acc = false, ex_write_to_spad = false, hardcode_d_to_garbage_addr = true)
 
   val leanPrintfConfig = defaultConfig.copy(dataflow=Dataflow.WS, max_in_flight_mem_reqs = 64, acc_read_full_width = false, ex_read_from_acc = false, ex_write_to_spad = false, hardcode_d_to_garbage_addr = true, use_firesim_simulation_counters=true)
@@ -254,6 +258,19 @@ object GemminiConfigs {
  */
 class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.defaultConfig
+) extends Config((site, here, up) => {
+  case BuildRoCC => up(BuildRoCC) ++ Seq(
+    (p: Parameters) => {
+      implicit val q = p
+      val gemmini = LazyModule(new Gemmini(gemminiConfig))
+      gemmini
+    }
+  )
+})
+
+// changed: added, same as DefaultGemminiConfig but with n:m sparse mode in the array
+class NMSparseGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.nmSparseConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => up(BuildRoCC) ++ Seq(
     (p: Parameters) => {

@@ -83,6 +83,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val DoConfig = functs(0) === CONFIG_CMD
   val DoComputes = functs.map(f => f === COMPUTE_AND_FLIP_CMD || f === COMPUTE_AND_STAY_CMD)
   val DoPreloads = functs.map(_ === PRELOAD_CMD)
+  val DoNmMeta = functs.map(_ === NM_META_CMD) // changed: n:m index rows
+  // changed: these sizes have to exist before ComputeCntlSignals gets built below,
+  // scala initializes vals top to bottom so defining them later gives a 0 bit field
+  val nm_row_bits = block_size * nm_idx_bits
+  val nm_rows_per_reg = if (nm_sparsity.isDefined) 64 / nm_row_bits else 1
 
   val preload_cmd_place = Mux(DoPreloads(0), 0.U, 1.U)
   // val a_address_place = Mux(current_dataflow === Dataflow.WS.id.U, 0.U, Mux(preload_cmd_place === 0.U, 1.U, 2.U))
@@ -184,7 +189,18 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(spatialArrayInputType, spatialArrayWeightType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
-    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks))
+    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks, nm = nm_sparsity)) // changed: pass n:m option
+
+  // changed: n:m sparse state
+  // nm_meta is the staging buffer the meta cmds write into, a preload reads it row by row as it fires
+  val nm_sparse_mode = RegInit(false.B)
+  val nm_meta = Reg(Vec(block_size, UInt(nm_row_bits.W)))
+  val nm_meta_wp = RegInit(0.U(log2Up(block_size + 2 * nm_rows_per_reg + 1).W))
+  // meta cmds finish whenever the completion port is free, this holds them till then
+  val nm_meta_done_q = Module(new Queue(UInt(log2Up(reservation_station_entries).W), 4))
+  nm_meta_done_q.io.enq.valid := false.B
+  nm_meta_done_q.io.enq.bits := DontCare
+  val ex_config_completing = WireInit(false.B)
 
   mesh.io.a.valid := false.B
   mesh.io.b.valid := false.B
@@ -205,6 +221,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh.io.req.bits.bd_transpose := cntl.bd_transpose
   mesh.io.req.bits.tag.rob_id := cntl.rob_id
   mesh.io.req.bits.flush := Mux(control_state === flush && !cntl_valid, 1.U, 0.U) // We want to make sure that the mesh has absorbed all inputs before flushing
+  mesh.io.req.bits.nm_sparse := false.B // changed: default, set from cntl below
+  mesh.io.d_meta.foreach(_ := DontCare)
 
   // Hazards
   val raw_hazards_are_impossible = !ex_read_from_acc && !ex_write_to_spad // Special case where RAW hazards are impossible
@@ -212,7 +230,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val raw_hazard_pre = mesh.io.tags_in_progress.map { t =>
     val is_garbage = t.addr.is_garbage()
     val pre_raw_haz = t.addr.is_same_address(rs1s(0))
-    val mul_raw_haz = t.addr.is_same_address(rs1s(1)) || t.addr.is_same_address(rs2s(1))
+    val mul_raw_haz = (t.addr.is_same_address(rs1s(1)) || t.addr.is_same_address(rs2s(1))) && !DoNmMeta(1) // changed: meta cmds have no addresses
 
     !is_garbage && (pre_raw_haz || mul_raw_haz) && !raw_hazards_are_impossible.B
   }.reduce(_ || _)
@@ -220,7 +238,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val raw_hazard_mulpre = mesh.io.tags_in_progress.map { t =>
     val is_garbage = t.addr.is_garbage()
     val pre_raw_haz = t.addr.is_same_address(rs1s(1))
-    val mul_raw_haz = t.addr.is_same_address(rs1s(2)) || t.addr.is_same_address(rs2s(2))
+    val mul_raw_haz = (t.addr.is_same_address(rs1s(2)) || t.addr.is_same_address(rs2s(2))) && !DoNmMeta(2) // changed: same here
 
     !is_garbage && (mul_raw_haz || pre_raw_haz) && !raw_hazards_are_impossible.B
   }.reduce(_ || _)
@@ -555,6 +573,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
               acc_scale := rs1s(0)(xLen - 1, 32).asTypeOf(acc_scale_t) // TODO magic number
               a_transpose := config_ex_rs1.a_transpose
               bd_transpose := config_ex_rs1.b_transpose
+              if (nm_sparsity.isDefined) {
+                nm_sparse_mode := config_ex_rs1.nm_sparse.asBool // changed: added
+              }
 
               if (dataflow == Dataflow.BOTH) {
                 current_dataflow := config_ex_rs1.dataflow
@@ -577,7 +598,27 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
           }
 
           io.completed := cmd.bits(0).rob_id
+          ex_config_completing := true.B // changed: so meta completions dont stomp on this
 
+          cmd.pop := 1.U
+        }
+
+        // changed: n:m index rows, just drop them in the staging buffer, no need to wait for the array
+        .elsewhen(DoNmMeta(0) && nm_meta_done_q.io.enq.ready) {
+          if (nm_sparsity.isDefined) {
+            for (ri <- 0 until 2; q <- 0 until nm_rows_per_reg) {
+              val reg = Seq(rs1s(0), rs2s(0))(ri)
+              val row = nm_meta_wp + (ri * nm_rows_per_reg + q).U
+              for (i <- 0 until block_size) {
+                when (row === i.U) {
+                  nm_meta(i) := reg((q + 1) * nm_row_bits - 1, q * nm_row_bits)
+                }
+              }
+            }
+            nm_meta_wp := nm_meta_wp + (2 * nm_rows_per_reg).U
+          }
+          nm_meta_done_q.io.enq.valid := cmd.bits(0).rob_id.valid
+          nm_meta_done_q.io.enq.bits := cmd.bits(0).rob_id.bits
           cmd.pop := 1.U
         }
 
@@ -639,6 +680,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         when(about_to_fire_all_rows) {
           cmd.pop := 1.U
           control_state := waiting_for_cmd
+          nm_meta_wp := 0.U // changed: this preload used up the staged indexes
 
           pending_completed_rob_ids(0).valid := cmd.bits(0).rob_id.valid && c_address_rs2.is_garbage()
           pending_completed_rob_ids(0).bits := cmd.bits(0).rob_id.bits
@@ -657,6 +699,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
         when(about_to_fire_all_rows) {
           cmd.pop := 2.U
           control_state := waiting_for_cmd
+          nm_meta_wp := 0.U // changed: same, the preload half of this pair used them
 
           pending_completed_rob_ids(0) := cmd.bits(0).rob_id
           pending_completed_rob_ids(1).valid := cmd.bits(1).rob_id.valid && c_address_rs2.is_garbage()
@@ -745,6 +788,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val im2colling = Bool()
 
     val first = Bool()
+
+    // changed: index row that goes with this d row, and whether we're in sparse mode
+    val nm_meta_row = UInt(nm_row_bits.W)
+    val nm_sparse = Bool()
   }
 
   mesh_cntl_signals_q.io.enq.valid := computing
@@ -799,6 +846,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.enq.bits.im2colling := im2col_wire && im2col_en //im2col_wire
 
   mesh_cntl_signals_q.io.enq.bits.first := !a_fire_started && !b_fire_started && !d_fire_started
+
+  // changed: d rows go in bottom first, so grab the matching index row the same way the spad read does
+  val nm_d_row = (block_size.U - 1.U - d_fire_counter_mulpre)(log2Up(block_size) - 1, 0)
+  mesh_cntl_signals_q.io.enq.bits.nm_meta_row := Mux(preload_zeros, 0.U, nm_meta(nm_d_row))
+  mesh_cntl_signals_q.io.enq.bits.nm_sparse := nm_sparse_mode
 
   val readData = VecInit(io.srams.read.map(_.resp.bits.data))
   val accReadData = if (ex_read_from_acc) VecInit(io.acc.read_resp.map(_.bits.data.asUInt)) else readData
@@ -885,6 +937,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     mesh.io.req.bits.tag.addr := cntl.c_addr
 
     mesh.io.req.bits.total_rows := cntl.total_rows
+
+    // changed: n:m stuff rides along with the row
+    mesh.io.req.bits.nm_sparse := cntl.nm_sparse
+    mesh.io.d_meta.foreach(_ := cntl.nm_meta_row.asTypeOf(Vec(meshColumns, Vec(tileColumns, UInt(nm_idx_bits.W)))))
   }
 
   when (cntl_valid && cntl.perform_single_preload) {
@@ -988,6 +1044,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       io.completed.bits := pending_completed_rob_ids(1).pop()
     }
   }
+  // changed: meta cmds complete in any cycle nobody else needs the port
+  val completion_port_free = !mesh_completed_rob_id_fire && !pending_completed_rob_ids(0).valid &&
+    !pending_completed_rob_ids(1).valid && !ex_config_completing
+  nm_meta_done_q.io.deq.ready := completion_port_free
+  when (completion_port_free && nm_meta_done_q.io.deq.valid) {
+    io.completed.valid := true.B
+    io.completed.bits := nm_meta_done_q.io.deq.bits
+  }
+
   val complete_bits_count = RegInit(0.U(15.W))
   when(io.completed.valid) {
     complete_bits_count := complete_bits_count + 1.U

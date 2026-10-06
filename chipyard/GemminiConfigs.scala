@@ -14,6 +14,20 @@ class GemminiRocketConfig extends Config(
   new chipyard.config.AbstractConfig)
 // DOC include end: GemminiRocketConfig
 
+// changed: added, gemmini with the n:m sparse weight stationary mode (2:4)
+class GemminiNMRocketConfig extends Config(
+  new gemmini.NMSparseGemminiConfig ++
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
+// changed: same thing but 4:8
+class GemminiNM48RocketConfig extends Config(
+  new gemmini.NMSparseGemminiConfig(gemmini.GemminiConfigs.nm48SparseConfig) ++
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new chipyard.config.AbstractConfig)
+
 class FPGemminiRocketConfig extends Config(
   new gemmini.GemminiFP32DefaultConfig ++                         // use FP32Gemmini systolic array GEMM accelerator
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++

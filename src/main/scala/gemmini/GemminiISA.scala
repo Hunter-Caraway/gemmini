@@ -38,6 +38,8 @@ object GemminiISA {
   val LOOP_WS_CONFIG_SPAD_AB = 24.U
   val LOOP_WS_CONFIG_SPAD_C = 25.U
 
+  val NM_META_CMD = 26.U // changed: added, stages n:m index rows for the next sparse preload
+
   // rs1[2:0] values
   val CONFIG_EX = 0.U
   val CONFIG_LOAD = 1.U
@@ -196,7 +198,8 @@ object GemminiISA {
   val CONFIG_EX_RS1_SET_ONLY_STRIDES_WIDTH = 1
   val CONFIG_EX_RS1_A_TRANSPOSE_WIDTH = 1
   val CONFIG_EX_RS1_B_TRANSPOSE_WIDTH = 1
-  val CONFIG_EX_RS1_SPACER1_WIDTH = (16 - 10)
+  val CONFIG_EX_RS1_NM_SPARSE_WIDTH = 1 // changed: rs1[10] turns on n:m sparse mode
+  val CONFIG_EX_RS1_SPACER1_WIDTH = (16 - 10 - 1)
   val CONFIG_EX_RS1_A_STRIDE_WIDTH = 16
   val CONFIG_EX_RS1_ACC_SCALE_WIDTH = 32
 
@@ -205,6 +208,7 @@ object GemminiISA {
     val acc_scale = UInt(acc_scale_bits.W)
     val a_stride = UInt(CONFIG_EX_RS1_A_STRIDE_WIDTH.W)
     val _spacer1 = UInt(CONFIG_EX_RS1_SPACER1_WIDTH.W)
+    val nm_sparse = UInt(CONFIG_EX_RS1_NM_SPARSE_WIDTH.W) // changed: added
     val b_transpose = UInt(CONFIG_EX_RS1_B_TRANSPOSE_WIDTH.W)
     val a_transpose = UInt(CONFIG_EX_RS1_A_TRANSPOSE_WIDTH.W)
     val set_only_strides = UInt(CONFIG_EX_RS1_SET_ONLY_STRIDES_WIDTH.W)

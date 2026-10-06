@@ -13,9 +13,17 @@ import Util._
   * @param rows Number of PEs on each row
   * @param columns Number of PEs on each column
   */
-class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: Dataflow.Value, tree_reduction: Boolean, max_simultaneous_matmuls: Int, val rows: Int, val columns: Int)(implicit ev: Arithmetic[T]) extends Module {
+class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: Dataflow.Value, tree_reduction: Boolean, max_simultaneous_matmuls: Int, val rows: Int, val columns: Int,
+                      nm: Option[(Int, Int)] = None)(implicit ev: Arithmetic[T]) extends Module { // changed: added n:m option
+  // changed: a is a group of m activations per row when n:m is on
+  val nm_idx_bits = nm.map { case (_, m) => log2Up(m) max 1 }.getOrElse(1)
+  val aType: Data = nm match {
+    case Some((_, m)) => Vec(m, inputType)
+    case None => inputType
+  }
+
   val io = IO(new Bundle {
-    val in_a        = Input(Vec(rows, inputType))
+    val in_a        = Input(Vec(rows, aType))
     val in_b        = Input(Vec(columns, outputType)) // This is the output of the tile next to it
     val in_d        = Input(Vec(columns, outputType))
 
@@ -23,7 +31,7 @@ class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df
     val in_id       = Input(Vec(columns, UInt(log2Up(max_simultaneous_matmuls).W)))
     val in_last  = Input(Vec(columns, Bool()))
 
-    val out_a       = Output(Vec(rows, inputType))
+    val out_a       = Output(Vec(rows, aType))
     val out_c       = Output(Vec(columns, outputType))
     val out_b       = Output(Vec(columns, outputType))
 
@@ -35,11 +43,15 @@ class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df
     val out_valid = Output(Vec(columns, Bool()))
 
     val bad_dataflow = Output(Bool())
+
+    // changed: weight indexes coming in the top and out the bottom
+    val in_meta = nm.map(_ => Input(Vec(columns, UInt(nm_idx_bits.W))))
+    val out_meta = nm.map(_ => Output(Vec(columns, UInt(nm_idx_bits.W))))
   })
 
   import ev._
 
-  val tile = Seq.fill(rows, columns)(Module(new PE(inputType, weightType, outputType, accType, df, max_simultaneous_matmuls)))
+  val tile = Seq.fill(rows, columns)(Module(new PE(inputType, weightType, outputType, accType, df, max_simultaneous_matmuls, nm)))
   val tileT = tile.transpose
 
   // TODO: abstract hori/vert broadcast, all these connections look the same
@@ -67,6 +79,17 @@ class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df
       case (in_d, pe) =>
         pe.io.in_d := in_d
         pe.io.out_c
+    }
+  }
+
+  // changed: pass the weight index down each column, same path as 'd'
+  if (nm.isDefined) {
+    for (c <- 0 until columns) {
+      tileT(c).foldLeft(io.in_meta.get(c)) {
+        case (in_meta, pe) =>
+          pe.io.in_meta.get := in_meta
+          pe.io.out_meta.get
+      }
     }
   }
 
@@ -113,6 +136,7 @@ class Tile[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df
     io.out_id(c) := tile(rows-1)(c).io.out_id
     io.out_last(c) := tile(rows-1)(c).io.out_last
     io.out_valid(c) := tile(rows-1)(c).io.out_valid
+    io.out_meta.foreach(_(c) := tile(rows-1)(c).io.out_meta.get) // changed: added
 
     io.out_b(c) := {
       if (tree_reduction) {

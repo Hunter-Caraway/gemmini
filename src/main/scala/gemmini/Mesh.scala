@@ -18,9 +18,17 @@ class Mesh[T <: Data : Arithmetic](inputType: T, weightType: T, outputType: T, a
                                    df: Dataflow.Value, tree_reduction: Boolean, tile_latency: Int,
                                    max_simultaneous_matmuls: Int, output_delay: Int,
                                    val tileRows: Int, val tileColumns: Int,
-                                   val meshRows: Int, val meshColumns: Int) extends Module {
+                                   val meshRows: Int, val meshColumns: Int,
+                                   nm: Option[(Int, Int)] = None) extends Module { // changed: added n:m option
+  // changed: a is a group of m activations per row when n:m is on
+  val nm_idx_bits = nm.map { case (_, m) => log2Up(m) max 1 }.getOrElse(1)
+  val aType: Data = nm match {
+    case Some((_, m)) => Vec(m, inputType)
+    case None => inputType
+  }
+
   val io = IO(new Bundle {
-    val in_a = Input(Vec(meshRows, Vec(tileRows, inputType)))
+    val in_a = Input(Vec(meshRows, Vec(tileRows, aType)))
     val in_b = Input(Vec(meshColumns, Vec(tileColumns, weightType)))
     val in_d = Input(Vec(meshColumns, Vec(tileColumns, weightType))) // TODO should this be weightType, inputType, or something like max(inputType, weightType)?
     val in_control = Input(Vec(meshColumns, Vec(tileColumns, new PEControl(accType))))
@@ -33,10 +41,13 @@ class Mesh[T <: Data : Arithmetic](inputType: T, weightType: T, outputType: T, a
     val out_control = Output(Vec(meshColumns, Vec(tileColumns, new PEControl(accType))))
     val out_id = Output(Vec(meshColumns, Vec(tileColumns, UInt(log2Up(max_simultaneous_matmuls).W))))
     val out_last = Output(Vec(meshColumns, Vec(tileColumns, Bool())))
+
+    // changed: weight indexes, enter the top with the preloaded weights
+    val in_meta = nm.map(_ => Input(Vec(meshColumns, Vec(tileColumns, UInt(nm_idx_bits.W)))))
   })
 
   // mesh(r)(c) => Tile at row r, column c
-  val mesh: Seq[Seq[Tile[T]]] = Seq.fill(meshRows, meshColumns)(Module(new Tile(inputType, weightType, outputType, accType, df, tree_reduction, max_simultaneous_matmuls, tileRows, tileColumns)))
+  val mesh: Seq[Seq[Tile[T]]] = Seq.fill(meshRows, meshColumns)(Module(new Tile(inputType, weightType, outputType, accType, df, tree_reduction, max_simultaneous_matmuls, tileRows, tileColumns, nm)))
   val meshT = mesh.transpose
 
   def pipe[T <: Data](valid: Bool, t: T, latency: Int): T = {
@@ -70,6 +81,17 @@ class Mesh[T <: Data : Arithmetic](inputType: T, weightType: T, outputType: T, a
       case ((in_propag, valid), tile) =>
         tile.io.in_d := pipe(valid.head, in_propag, tile_latency+1)
         (tile.io.out_c, tile.io.out_valid)
+    }
+  }
+
+  // changed: chain the weight indexes down each column, timed exactly like in_d
+  if (nm.isDefined) {
+    for (c <- 0 until meshColumns) {
+      meshT(c).foldLeft((io.in_meta.get(c), io.in_valid(c))) {
+        case ((in_meta, valid), tile) =>
+          tile.io.in_meta.get := pipe(valid.head, in_meta, tile_latency+1)
+          (tile.io.out_meta.get, tile.io.out_valid)
+      }
     }
   }
 

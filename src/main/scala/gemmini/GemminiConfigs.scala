@@ -100,9 +100,26 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              tl_ext_mem_base: BigInt = 0,
                                                                              clock_gate: Boolean = false,
 
+                                                                             // changed: n:m sparse weight stationary mode, None means plain dense hardware
+                                                                             nm_sparsity: Option[(Int, Int)] = None,
+
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
   require(inputType.getWidth == weightType.getWidth)
+
+  // changed: n:m sanity checks. the activation row comes in as a + bd so m has to be 2*n
+  nm_sparsity.foreach { case (n, m) =>
+    require(n > 0 && m == 2 * n, s"n:m sparsity needs m == 2*n, got $n:$m")
+    require((meshRows * tileRows) % n == 0, "array rows have to split evenly into n-sized groups")
+    require(dataflow != Dataflow.OS, "n:m sparse mode is weight stationary only")
+    require(!hardcode_d_to_garbage_addr, "sparse mode streams the upper half of a through the bd slot")
+    require(spatialArrayInputType.getWidth == spatialArrayWeightType.getWidth, "sparse mode reuses the b port for activations")
+    require(isPow2(m), "keep m a power of 2 so the index is log2(m) bits")
+    require(meshColumns * tileColumns * log2Up(m) <= 64, "one index row has to fit in a 64 bit reg")
+  }
+  val nm_n = nm_sparsity.map(_._1).getOrElse(1)
+  val nm_m = nm_sparsity.map(_._2).getOrElse(1)
+  val nm_idx_bits = log2Up(nm_m) max 1
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
@@ -502,6 +519,13 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     if (has_normalizations) {
       header ++= "#define HAS_NORMALIZATIONS\n"
       header ++= "#define NORM_STAT_IDS 2\n\n"
+    }
+
+    // changed: let software know the hardware n:m pattern
+    nm_sparsity.foreach { case (n, m) =>
+      header ++= s"#define HAS_NM_SPARSITY\n"
+      header ++= s"#define NM_N $n\n"
+      header ++= s"#define NM_M $m\n\n"
     }
 
     header ++= s"#endif // $guard\n"
