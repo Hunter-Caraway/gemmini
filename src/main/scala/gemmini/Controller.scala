@@ -354,6 +354,10 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   store_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.st.rob_id)
 
   ex_controller.io.cmd.valid := reservation_station.io.issue.ex.valid
+  // changed: index rows for n:m sparse mode, driven by the dispatch below
+  ex_controller.io.nm_meta_in.valid := false.B
+  ex_controller.io.nm_meta_in.bits.rs1 := unrolled_cmd.bits.cmd.rs1
+  ex_controller.io.nm_meta_in.bits.rs2 := unrolled_cmd.bits.cmd.rs2
   reservation_station.io.issue.ex.ready := ex_controller.io.cmd.ready
   ex_controller.io.cmd.bits := reservation_station.io.issue.ex.cmd
   ex_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ex.rob_id)
@@ -477,6 +481,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     val is_flush = risc_funct === FLUSH_CMD
     val is_counter_op = risc_funct === COUNTER_OP
     val is_clock_gate_en = risc_funct === CLKGATE_EN
+    val is_nm_meta = risc_funct === NM_META_CMD // changed: n:m index rows skip the reservation station
 
     /*
     val is_load = (funct === LOAD_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
@@ -502,6 +507,13 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
     .elsewhen (is_clock_gate_en) {
       unrolled_cmd.ready := true.B
+    }
+
+    // changed: index rows go right into the ex controller's index fifo. order still holds since
+    // preloads pop that fifo in program order too, and nothing here waits on a rob slot
+    .elsewhen (is_nm_meta) {
+      ex_controller.io.nm_meta_in.valid := true.B
+      unrolled_cmd.ready := ex_controller.io.nm_meta_in.ready
     }
 
     .otherwise {
