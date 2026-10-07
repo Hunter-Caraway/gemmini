@@ -1,3 +1,9 @@
+> **This is a fork of [ucb-bar/gemmini](https://github.com/ucb-bar/gemmini). Gemmini is UC Berkeley's work.**
+> The `sparse-nm` branch adds 2:4 / 4:8 structured (N:M) sparsity in weight-stationary mode. Everything up to
+> commit `8c3f9923` is unmodified upstream Gemmini; only the commits after it on `sparse-nm` are ours (by Hunter
+> Caraway), touching 10 Scala files (+277/−20 lines). See `git diff 8c3f9923 sparse-nm`. The benchmarks,
+> results, and instructions are in [Structured-4-8-Sparsity-with-Gemmini](https://github.com/Hunter-Caraway/Structured-4-8-Sparsity-with-Gemmini).
+
 <p align="center">
   <img width="1000" src="./img/full-logo.svg">
 </p>
