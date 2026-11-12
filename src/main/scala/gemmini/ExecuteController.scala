@@ -22,6 +22,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       val rs1 = UInt(64.W)
       val rs2 = UInt(64.W)
     }))
+    val nm_clear = Input(Bool()) // changed: NM_META_CMD clear (rd == 1), pulsed at dispatch
+    // changed: Fix A. ROB ids of finished scratchpad index loads (NM_META_CMD rd == 2), and two signals the
+    // controller's program-order protocol checks need
+    val nm_ld_completed = Decoupled(UInt(log2Up(reservation_station_entries).W))
+    val nm_reg_tile = Output(Bool()) // a register-path index tile was completed (its last row cmd was accepted)
+    val nm_asm_busy = Output(Bool()) // a register-path index tile is half sent
 
     val im2col = new Bundle {
       val req = Decoupled(new Im2ColReadReq(config))
@@ -67,7 +73,31 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
   }
 
-  val unrolled_cmd = TransposePreloadUnroller(io.cmd, config, io.counter)
+  // changed: Fix A. NM_META_CMD rd == 2 (index tiles from the scratchpad) never enters the in-order cmd queue: it is
+  // diverted here into the index loader's side queue, so it can't split a compute from the preload it overlaps with
+  // or hide a compute from the raw hazard checks (which look at queue heads 1 and 2). 4 deep: the most loads a
+  // legal program can have waiting while an earlier preload still needs a later command to start (fix-a-spec.md).
+  class NmLoadCmd extends Bundle {
+    val addr = local_addr_t.cloneType
+    val tiles = UInt(3.W)
+    val rob_id = UInt(log2Up(reservation_station_entries).W)
+  }
+  val nm_ld_q = if (nm_sparsity.isDefined) Some(Module(new Queue(new NmLoadCmd, nm_meta_fifo_depth))) else None
+  val unrolled_cmd = nm_ld_q match {
+    case Some(ldq) =>
+      val is_nm_ld = io.cmd.bits.cmd.inst.funct === NM_META_CMD // the controller only sends rd == 2 here
+      val ex_cmd = Wire(Decoupled(new GemminiCmd(reservation_station_entries)))
+      ex_cmd.valid := io.cmd.valid && !is_nm_ld
+      ex_cmd.bits := io.cmd.bits
+      ldq.io.enq.valid := io.cmd.valid && is_nm_ld
+      ldq.io.enq.bits.addr := io.cmd.bits.cmd.rs1(31, 0).asTypeOf(local_addr_t)
+      ldq.io.enq.bits.tiles := io.cmd.bits.cmd.rs2(2, 0)
+      ldq.io.enq.bits.rob_id := io.cmd.bits.rob_id.bits
+      io.cmd.ready := Mux(is_nm_ld, ldq.io.enq.ready, ex_cmd.ready)
+      TransposePreloadUnroller(ex_cmd, config, io.counter)
+    case None =>
+      TransposePreloadUnroller(io.cmd, config, io.counter)
+  }
 
   val cmd_q_heads = 3
   assert(ex_queue_length >= cmd_q_heads)
@@ -89,8 +119,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val DoConfig = functs(0) === CONFIG_CMD
   val DoComputes = functs.map(f => f === COMPUTE_AND_FLIP_CMD || f === COMPUTE_AND_STAY_CMD)
   val DoPreloads = functs.map(_ === PRELOAD_CMD)
-  // changed: these sizes have to exist before ComputeCntlSignals gets built below,
-  // scala initializes vals top to bottom so defining them later gives a 0 bit field
+  // changed: must be defined before ComputeCntlSignals below (Scala vals initialise top to bottom)
   val nm_row_bits = block_size * nm_idx_bits
   val nm_rows_per_reg = if (nm_sparsity.isDefined) 64 / nm_row_bits else 1
 
@@ -196,15 +225,26 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val mesh = Module(new MeshWithDelays(spatialArrayInputType, spatialArrayWeightType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
     tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks, nm = nm_sparsity)) // changed: pass n:m option
 
-  // changed: n:m sparse state
-  // index rows come in from the controller and get assembled into whole DIM x DIM index tiles,
-  // finished tiles wait in nm_meta_q. every real sparse preload pops one tile as it fires
-  // (garbage/zero preloads dont). both streams are in program order so they line up
+  // changed: n:m sparse state.
+  // Index rows from the controller are assembled into DIM x DIM index tiles that wait in nm_meta_q. Every real
+  // sparse preload pops one tile as it fires (GARBAGE preloads don't); both streams are in program order.
+  // NM_META_FIFO_DEPTH: software may be at most 4 tiles ahead of the preloads that consume them (a tile counts until
+  // its preload fires, which needs its compute dispatched). A 5th tile blocks dispatch forever (asserted in Controller).
   val nm_sparse_mode = RegInit(false.B)
   val nm_rows_per_cmd = 2 * nm_rows_per_reg
   val nm_tile_t = Vec(block_size, UInt(nm_row_bits.W))
-  val nm_meta_q = Module(new Queue(nm_tile_t, 4))
+  val NM_META_FIFO_DEPTH = nm_meta_fifo_depth // changed: Fix A, the value (4) now lives in the config
+  val nm_meta_q = Module(new Queue(nm_tile_t, NM_META_FIFO_DEPTH, hasFlush = true))
+  nm_meta_q.io.flush.get := io.nm_clear
   val nm_asm = Reg(nm_tile_t)
+
+  // changed: Fix A. scratchpad index loader -> row assembler; driven by the loader at the end of this file
+  val nm_ld_busy = WireInit(false.B)  // a load is active: it owns the row assembler and the fifo's enq port
+  val nm_ld_chunk = WireInit(false.B) // one scratchpad row of index bits arrives this cycle
+  val nm_ld_chunk_idx = WireInit(0.U(log2Up(nm_spad_rows_per_tile max 2).W)) // its row within the tile
+  val nm_ld_chunk_data = WireInit(0.U(sp_width.W))
+  val nm_resp_is_ld = WireInit(VecInit(Seq.fill(sp_banks)(false.B))) // bank's next ex read response is the loader's
+  val nm_op_rd = WireInit(VecInit(Seq.fill(sp_banks)(false.B)))      // operand reads use the bank's read port now
   val nm_asm_row = RegInit(0.U(log2Up(block_size + nm_rows_per_cmd + 1).W))
 
   val nm_in_rows = for (ri <- 0 until 2; q <- 0 until nm_rows_per_reg) yield {
@@ -217,19 +257,39 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   })
   val nm_last_cmd = nm_asm_row + nm_rows_per_cmd.U >= block_size.U
 
+  // changed: Fix A. a loader chunk replaces scratchpad-row-sized slice j of the tile, seen as one flat bit string
+  // with row 0 / column 0 lowest (the tight packing of fix-a-spec.md section 3)
+  val nm_asm_flat = nm_asm.asUInt
+  val nm_asm_ld_next = Cat((0 until nm_spad_rows_per_tile).reverse.map { j =>
+    val lo = j * sp_width
+    val hi = ((j + 1) * sp_width min nm_asm_flat.getWidth) - 1
+    Mux(nm_ld_chunk_idx === j.U, nm_ld_chunk_data(hi - lo, 0), nm_asm_flat(hi, lo))
+  }).asTypeOf(nm_tile_t)
+  val nm_ld_last_chunk = nm_ld_chunk_idx === (nm_spad_rows_per_tile - 1).U
+
   if (nm_sparsity.isDefined) {
-    io.nm_meta_in.ready := !nm_last_cmd || nm_meta_q.io.enq.ready
-    nm_meta_q.io.enq.valid := io.nm_meta_in.valid && nm_last_cmd
-    nm_meta_q.io.enq.bits := nm_asm_next
+    // changed: Fix A, register rows wait while a scratchpad load owns the assembler (mixing is asserted in Controller)
+    io.nm_meta_in.ready := !nm_ld_busy && (!nm_last_cmd || nm_meta_q.io.enq.ready)
+    nm_meta_q.io.enq.valid := Mux(nm_ld_busy, nm_ld_chunk && nm_ld_last_chunk, io.nm_meta_in.valid && nm_last_cmd) // changed: Fix A
+    nm_meta_q.io.enq.bits := Mux(nm_ld_busy, nm_asm_ld_next, nm_asm_next) // changed: Fix A
     when (io.nm_meta_in.fire) {
       nm_asm := nm_asm_next
       nm_asm_row := Mux(nm_last_cmd, 0.U, nm_asm_row + nm_rows_per_cmd.U)
     }
+    when (nm_ld_chunk) {
+      nm_asm := nm_asm_ld_next // changed: Fix A
+    }
+    when (io.nm_clear) {
+      nm_asm_row := 0.U // drop a half-assembled tile
+    }
+    io.nm_reg_tile := io.nm_meta_in.fire && nm_last_cmd // changed: Fix A
+    io.nm_asm_busy := nm_asm_row =/= 0.U // changed: Fix A
   } else {
-    // no sparse hardware, just eat them
-    io.nm_meta_in.ready := true.B
+    io.nm_meta_in.ready := true.B // dense build: Controller asserts on funct 26
     nm_meta_q.io.enq.valid := false.B
     nm_meta_q.io.enq.bits := DontCare
+    io.nm_reg_tile := false.B // changed: Fix A
+    io.nm_asm_busy := false.B // changed: Fix A
   }
   nm_meta_q.io.deq.ready := false.B
 
@@ -298,6 +358,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val c_addr_stride = Reg(UInt(16.W)) // TODO magic numbers
 
   val a_address = a_address_rs1 + a_addr_offset
+  // changed: in sparse mode a_hi comes through B with stride 1 (b_address_rs2 + i), ignoring A_stride
   val b_address = b_address_rs2 + b_fire_counter
   val d_address = d_address_rs1 + (block_size.U - 1.U - d_fire_counter)
 
@@ -473,6 +534,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val read_a = a_valid && !a_read_from_acc && dataAbank === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !(im2col_wire&&im2col_en)
     val read_b = b_valid && !b_read_from_acc && dataBbank === i.U && start_inputting_b && !accumulate_zeros && b_row_is_not_all_zeros //&& !im2col_wire
     val read_d = d_valid && !d_read_from_acc && dataDbank === i.U && start_inputting_d && !preload_zeros && d_row_is_not_all_zeros //&& !im2col_wire
+    nm_op_rd(i) := (read_a || read_b || read_d) && cntl_ready // changed: Fix A, the index loader only takes free ports
 
     Seq((read_a, a_ready), (read_b, b_ready), (read_d, d_ready)).foreach { case (rd, r) =>
       when (rd && !io.srams.read(i).req.ready) {
@@ -609,7 +671,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
               a_transpose := config_ex_rs1.a_transpose
               bd_transpose := config_ex_rs1.b_transpose
               if (nm_sparsity.isDefined) {
-                nm_sparse_mode := config_ex_rs1.nm_sparse.asBool // changed: added
+                // changed: sparse mode needs WS and no transposes; otherwise assert and force it off
+                val cfg_is_ws = if (dataflow == Dataflow.BOTH) config_ex_rs1.dataflow === Dataflow.WS.id.U else (dataflow == Dataflow.WS).B
+                val cfg_nm_legal = cfg_is_ws && !config_ex_rs1.a_transpose.asBool && !config_ex_rs1.b_transpose.asBool
+                assert(!(config_ex_rs1.nm_sparse.asBool && !cfg_nm_legal),
+                  "n:m sparse mode (config_ex rs1[10]) needs weight stationary dataflow with a_transpose = 0 and b_transpose = 0")
+                nm_sparse_mode := config_ex_rs1.nm_sparse.asBool && cfg_nm_legal
+              } else {
+                // changed: full config_ex only; strides-only configs from the loop unrollers leave bit 10 DontCare
+                assert(config_ex_rs1.nm_sparse === 0.U, "config_ex rs1[10] (n:m sparse mode) set on a dense build (nm_sparsity = None)")
               }
 
               if (dataflow == Dataflow.BOTH) {
@@ -867,11 +937,30 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.enq.bits.nm_meta_row := Mux(nm_preload_needs_meta, nm_meta_q.io.deq.bits(nm_d_row), 0.U)
   mesh_cntl_signals_q.io.enq.bits.nm_sparse := nm_sparse_mode
 
+  // changed: sparse mode latched per PE weight buffer (1 = c2, 0 = c1). The buffer select mirrors MeshWithDelays.in_prop:
+  // a req with propagate p multiplies buffer p and preloads into ~p. Real (non-GARBAGE) preloads latch the mode.
+  if (nm_sparsity.isDefined) {
+    val nm_buf_sparse = RegInit(VecInit(Seq.fill(2)(false.B)))
+    val nm_mesh_prop = RegInit(0.U(1.W))
+    val nm_req_prop = nm_mesh_prop ^ mesh.io.req.bits.pe_control.propagate
+    when (mesh.io.req.fire) {
+      nm_mesh_prop := nm_req_prop
+      when (cntl_valid && (cntl.perform_single_mul || cntl.perform_mul_pre)) {
+        assert(nm_buf_sparse(nm_req_prop) === cntl.nm_sparse,
+          "n:m sparse mode of a compute differs from the mode its weights were preloaded in")
+      }
+      when (cntl_valid && (cntl.perform_single_preload || cntl.perform_mul_pre) && !cntl.preload_zeros) {
+        nm_buf_sparse(~nm_req_prop) := cntl.nm_sparse
+      }
+    }
+  }
+
   val readData = VecInit(io.srams.read.map(_.resp.bits.data))
   val accReadData = if (ex_read_from_acc) VecInit(io.acc.read_resp.map(_.bits.data.asUInt)) else readData
   val im2ColData = io.im2col.resp.bits.a_im2col.asUInt
 
-  val readValid = VecInit(io.srams.read.map(bank => ex_read_from_spad.B && bank.resp.valid && !bank.resp.bits.fromDMA))
+  // changed: Fix A, responses to the index loader's reads are hidden from the operand path
+  val readValid = VecInit(io.srams.read.zipWithIndex.map { case (bank, i) => ex_read_from_spad.B && bank.resp.valid && !bank.resp.bits.fromDMA && !nm_resp_is_ld(i) })
   val accReadValid = VecInit(io.acc.read_resp.map(bank => ex_read_from_acc.B && bank.valid && !bank.bits.fromDMA))
   val im2ColValid = io.im2col.resp.valid
 
@@ -1067,6 +1156,90 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   when (reset.asBool) {
     // pending_completed_rob_id.valid := false.B
     pending_completed_rob_ids.foreach(_.valid := false.B)
+  }
+
+  // changed: Fix A. n:m index loader, runs the NM_META_CMD rd == 2 loads from nm_ld_q one at a time (fix-a-spec.md).
+  // It reads the load's rows from the scratchpad, one per cycle, only on cycles the operand reads leave that bank's read
+  // port free, writes each row into the row assembler (nm_asm) and pushes each finished tile into nm_meta_q. Before
+  // reading the first row of a tile it reserves a fifo slot, so it always takes its responses as they arrive and never
+  // holds up an operand response queued behind them. A per-bank owner queue records, for every ex read of the bank in
+  // order, whether it was the loader's; that is how its responses are told apart and hidden from readValid.
+  // The load's ROB entry completes once all its tiles are in nm_meta_q.
+  nm_ld_q match {
+    case Some(ldq) =>
+      // the owner queues assume every response on io.srams.read answers a request made on it; im2col shares the
+      // ports (Controller.scala) and would break that
+      require(!hasIm2Col, "the n:m index loader needs the scratchpad read ports to itself (no im2col)")
+      val R = nm_spad_rows_per_tile
+      val ld = ldq.io.deq.bits
+      val active = ldq.io.deq.valid
+      nm_ld_busy := active
+
+      val irow = RegInit(0.U(log2Up(7 * R + 1).W)) // rows read so far
+      val ichunk = RegInit(0.U(log2Up(R max 2).W)) // row within its tile of the next read
+      val itile = RegInit(0.U(3.W))                // tiles whose first row has been read
+      val rchunk = RegInit(0.U(log2Up(R max 2).W)) // row within its tile of the next response
+      val rtile = RegInit(0.U(3.W))                // tiles pushed into nm_meta_q
+
+      val bank = ld.addr.sp_bank() // all rows of a load are in one bank (asserted in Controller)
+      val rd_addr = ld.addr + irow
+      val owners = Seq.fill(sp_banks)(Module(new Queue(Bool(), spad_read_delay + 6)))
+
+      val room = (nm_meta_q.io.count +& (itile - rtile)) < nm_meta_fifo_depth.U
+      val port_free = !nm_op_rd(bank) && VecInit(io.srams.read.map(_.req.ready))(bank) &&
+        VecInit(owners.map(_.io.enq.ready))(bank)
+      val issue = active && irow < ld.tiles * R.U && (ichunk =/= 0.U || room) && port_free
+
+      when (issue) {
+        irow := irow + 1.U
+        ichunk := Mux(ichunk === (R - 1).U, 0.U, ichunk + 1.U)
+        when (ichunk === 0.U) {
+          itile := itile + 1.U
+        }
+      }
+
+      nm_ld_chunk := active && nm_resp_is_ld(bank) && VecInit(io.srams.read.map(_.resp.valid))(bank)
+      nm_ld_chunk_idx := rchunk
+      nm_ld_chunk_data := VecInit(io.srams.read.map(_.resp.bits.data))(bank)
+      when (nm_ld_chunk) {
+        rchunk := Mux(rchunk === (R - 1).U, 0.U, rchunk + 1.U)
+        when (rchunk === (R - 1).U) {
+          rtile := rtile + 1.U
+        }
+      }
+      assert(!(nm_ld_chunk && nm_ld_last_chunk && !nm_meta_q.io.enq.ready), "n:m index loader: index fifo full at enqueue")
+
+      for (i <- 0 until sp_banks) {
+        val mine = issue && bank === i.U
+        when (mine) {
+          io.srams.read(i).req.valid := true.B
+          io.srams.read(i).req.bits.addr := rd_addr.sp_row()
+          io.srams.read(i).req.bits.fromDMA := false.B
+        }
+        when (nm_ld_chunk && bank === i.U) {
+          io.srams.read(i).resp.ready := true.B
+        }
+        owners(i).io.enq.valid := io.srams.read(i).req.fire
+        owners(i).io.enq.bits := mine
+        owners(i).io.deq.ready := io.srams.read(i).resp.fire
+        nm_resp_is_ld(i) := owners(i).io.deq.valid && owners(i).io.deq.bits
+        assert(!(io.srams.read(i).req.fire && !owners(i).io.enq.ready), "n:m index loader: spad read owner queue overflow")
+        assert(!(io.srams.read(i).resp.valid && !owners(i).io.deq.valid), "n:m index loader: spad read response with no request")
+      }
+
+      io.nm_ld_completed.valid := active && rtile === ld.tiles
+      io.nm_ld_completed.bits := ld.rob_id
+      ldq.io.deq.ready := io.nm_ld_completed.fire
+      when (io.nm_ld_completed.fire) {
+        irow := 0.U
+        ichunk := 0.U
+        itile := 0.U
+        rchunk := 0.U
+        rtile := 0.U
+      }
+    case None =>
+      io.nm_ld_completed.valid := false.B
+      io.nm_ld_completed.bits := DontCare
   }
 
   // Performance counter

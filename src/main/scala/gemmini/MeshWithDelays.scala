@@ -182,10 +182,8 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
 
   nm match {
     case Some((n, m)) =>
-      // changed: n:m sparse mode
-      // the dense activation row is 2*block_size wide: a gives the low half, b (the bias slot) the high half.
-      // array row r holds a squashed weight from group r/n so it needs the m activations of that group.
-      // in dense mode each row just gets its own activation in slot 0 and the index stays 0
+      // changed: n:m sparse mode. The 2*DIM activation row is a (low half) ++ b (high half, the bias slot); array row r
+      // holds a weight of group r/n, so it gets that group's m activations. Dense mode: own activation in slot 0, index 0.
       val sparse = req.bits.nm_sparse
       val zero_a = 0.U.asTypeOf(inputType)
       val a_flat = a_shifter_in.flatten

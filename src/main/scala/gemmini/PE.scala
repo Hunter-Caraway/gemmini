@@ -87,8 +87,7 @@ class PE[T <: Data](inputType: T, weightType: T, outputType: T, accType: T, df: 
   val m1 = nm.map(_ => Reg(UInt(nm_idx_bits.W)))
   val m2 = nm.map(_ => Reg(UInt(nm_idx_bits.W)))
 
-  // changed: pick the activation, ws uses the index of the weight we're multiplying with
-  // (c2 when propagating, c1 otherwise), os just takes slot 0 like a dense pe
+  // changed: WS picks the activation by the index of the weight in use (c2 when propagating, else c1); OS uses slot 0
   val a: T = nm match {
     case Some(_) =>
       val cur_meta = Mux(prop === 1.U, m2.get, m1.get)

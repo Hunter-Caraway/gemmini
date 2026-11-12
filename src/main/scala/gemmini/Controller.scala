@@ -268,6 +268,20 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   val unrolled_cmd = Queue(loop_cmd)
   unrolled_cmd.ready := false.B
+
+  // changed: LOOP_WS / LOOP_CONV_WS are illegal in sparse mode; track rs1[10] of the last full config_ex in program order
+  if (nm_sparsity.isDefined) {
+    val nm_loop_sparse = RegInit(false.B)
+    val rc_funct = raw_cmd.bits.cmd.inst.funct
+    val rc_cfg = raw_cmd.bits.cmd.rs1.asTypeOf(new ConfigExRs1(acc_scale_t_bits))
+    when (raw_cmd.fire) {
+      when (rc_funct === CONFIG_CMD && rc_cfg.cmd_type === CONFIG_EX && !rc_cfg.set_only_strides.asBool) {
+        nm_loop_sparse := rc_cfg.nm_sparse.asBool
+      }
+      assert(!(nm_loop_sparse && (rc_funct === LOOP_WS || rc_funct === LOOP_CONV_WS)),
+        "LOOP_WS / LOOP_CONV_WS issued while n:m sparse mode (config_ex rs1[10]) is on")
+    }
+  }
   counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
 
   // Wire up controllers to ROB
@@ -358,6 +372,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   ex_controller.io.nm_meta_in.valid := false.B
   ex_controller.io.nm_meta_in.bits.rs1 := unrolled_cmd.bits.cmd.rs1
   ex_controller.io.nm_meta_in.bits.rs2 := unrolled_cmd.bits.cmd.rs2
+  ex_controller.io.nm_clear := false.B
   reservation_station.io.issue.ex.ready := ex_controller.io.cmd.ready
   ex_controller.io.cmd.bits := reservation_station.io.issue.ex.cmd
   ex_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ex.rob_id)
@@ -426,7 +441,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   //-------------------------------------------------------------------------
   // risc
-  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), 3))
+  // changed: Fix A, a 4th (lowest priority) input for the n:m index loader's completions
+  val reservation_station_completed_arb = Module(new Arbiter(UInt(log2Up(reservation_station_entries).W), if (nm_sparsity.isDefined) 4 else 3))
 
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid
   reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
@@ -438,6 +454,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.in(0).valid := ex_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(1).valid := load_controller.io.completed.valid // && !is_cisc_mode
   reservation_station_completed_arb.io.in(2).valid := store_controller.io.completed.valid // && !is_cisc_mode
+  if (nm_sparsity.isDefined) {
+    reservation_station_completed_arb.io.in(3) <> ex_controller.io.nm_ld_completed // changed: Fix A
+  } else {
+    ex_controller.io.nm_ld_completed.ready := false.B // changed: Fix A, never valid on a dense build
+  }
 
   reservation_station.io.completed.valid := reservation_station_completed_arb.io.out.valid
   reservation_station.io.completed.bits := reservation_station_completed_arb.io.out.bits
@@ -509,11 +530,30 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       unrolled_cmd.ready := true.B
     }
 
-    // changed: index rows go right into the ex controller's index fifo. order still holds since
-    // preloads pop that fifo in program order too, and nothing here waits on a rob slot
+    // changed: index rows skip the reservation station; preloads pop them in program order
     .elsewhen (is_nm_meta) {
-      ex_controller.io.nm_meta_in.valid := true.B
-      unrolled_cmd.ready := ex_controller.io.nm_meta_in.ready
+      if (nm_sparsity.isEmpty) {
+        assert(false.B, "NM_META_CMD (funct 26) on a dense build (nm_sparsity = None)")
+      }
+      when (unrolled_cmd.bits.cmd.inst.rd === 1.U) {
+        // changed: rd == 1 is a clear: empty the index fifo and the row assembler (software fences first)
+        ex_controller.io.nm_clear := true.B
+        unrolled_cmd.ready := true.B
+      }.elsewhen (nm_sparsity.isDefined.B && unrolled_cmd.bits.cmd.inst.rd === 2.U) {
+        // changed: Fix A. rd == 2 loads index tiles from the scratchpad. It goes through the reservation station (ex
+        // queue) so it is ordered against the mvins of its rows; the ExecuteController hands it to its index loader.
+        reservation_station.io.alloc.valid := true.B
+        when (reservation_station.io.alloc.fire) {
+          unrolled_cmd.ready := true.B
+        }
+      }.elsewhen (nm_sparsity.isDefined.B && unrolled_cmd.bits.cmd.inst.rd =/= 0.U) {
+        // changed: Fix A. rd 3..31 are reserved: assert and drop
+        assert(false.B, "NM_META_CMD (funct 26): rd values 3..31 are reserved")
+        unrolled_cmd.ready := true.B
+      }.otherwise {
+        ex_controller.io.nm_meta_in.valid := true.B
+        unrolled_cmd.ready := ex_controller.io.nm_meta_in.ready
+      }
     }
 
     .otherwise {
@@ -523,6 +563,88 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
         // compressed_cmd.ready := true.B
         unrolled_cmd.ready := true.B
       }
+    }
+  }
+
+  // changed: index fifo deadlock check. While index rows are blocked, any preload that could pop the fifo sits in the
+  // RS with its compute (2+ entries, busy), so a blocked fifo with a non-busy RS can never drain.
+  if (nm_sparsity.isDefined) {
+    val nm_dead_cnt = RegInit(0.U(8.W))
+    val nm_dead = ex_controller.io.nm_meta_in.valid && !ex_controller.io.nm_meta_in.ready && !reservation_station.io.busy
+    nm_dead_cnt := Mux(nm_dead, nm_dead_cnt + 1.U, 0.U)
+    assert(nm_dead_cnt =/= 255.U, "n:m index fifo deadlock: more than 4 index tiles sent ahead of their preloads")
+  }
+
+  // changed: Fix A. Program-order model of the index fifo, the same one the Spike model keeps, checked as commands
+  // are dispatched (fix-a-spec.md sections 5 and 7). nm_q = tiles sent minus tiles popped by real sparse preloads;
+  // nm_in_flight = a real sparse preload popped a tile and no compute has followed yet (its slot is still held).
+  if (nm_sparsity.isDefined) {
+    val c = unrolled_cmd.bits.cmd
+    val f = c.inst.funct
+    val is_nm = f === NM_META_CMD
+    val nm_q = RegInit(0.U(4.W))
+    val nm_in_flight = RegInit(false.B)
+    val nm_mode = RegInit(false.B) // sparse mode of the last full config_ex dispatched
+    val nm_ld_since_clear = RegInit(false.B)
+    val nm_ld_pending = RegInit(0.U(log2Up(reservation_station_entries + 1).W)) // rd == 2 loads not finished
+    val nm_room = nm_meta_fifo_depth.U -& (nm_q +& nm_in_flight)
+
+    val sp_addr_bits = log2Ceil(sp_banks * sp_bank_entries)
+    val sp_bank_row_bits = log2Ceil(sp_bank_entries)
+    val ld_n = c.rs2(7, 0)
+    val ld_first = c.rs1(sp_addr_bits - 1, 0)
+    val ld_last = ld_first +& (ld_n * nm_spad_rows_per_tile.U) - 1.U
+
+    val cfg = c.rs1.asTypeOf(new ConfigExRs1(acc_scale_t_bits))
+    val cfg_is_ws = if (dataflow == Dataflow.BOTH) cfg.dataflow === Dataflow.WS.id.U else (dataflow == Dataflow.WS).B
+    val d_garbage = c.rs1(31, 0).asTypeOf(local_addr_t).is_garbage()
+
+    when (unrolled_cmd.fire) {
+      when (is_nm && c.inst.rd === 2.U) {
+        assert(ld_n >= 1.U && ld_n <= nm_meta_fifo_depth.U, "NM_META_CMD rd == 2: tile count rs2[7:0] must be 1..4")
+        assert(c.rs1(63, 32) === 0.U && c.rs2(63, 8) === 0.U, "NM_META_CMD rd == 2: rs1[63:32] and rs2[63:8] must be 0")
+        assert(c.rs1(31, sp_addr_bits) === 0.U,
+          "NM_META_CMD rd == 2: rs1 must be a scratchpad row address (not accumulator, not GARBAGE)")
+        assert(ld_n === 0.U || (ld_first >> sp_bank_row_bits) === (ld_last >> sp_bank_row_bits),
+          "NM_META_CMD rd == 2: the index rows must all lie in one scratchpad bank")
+        assert(!ex_controller.io.nm_asm_busy, "NM_META_CMD rd == 2 while a register-path index tile is half sent")
+        assert(ld_n <= nm_room, "n:m index fifo: more than 4 index tiles ahead of their preloads")
+        nm_q := nm_q + ld_n
+        nm_ld_since_clear := true.B
+      }
+      when (is_nm && c.inst.rd === 1.U) {
+        assert(nm_ld_pending === 0.U, "NM_META_CMD clear (rd == 1) while a scratchpad index load is outstanding: fence first")
+        assert(!nm_in_flight, "NM_META_CMD clear (rd == 1) between a sparse preload and its compute: fence first")
+        nm_q := 0.U
+        nm_ld_since_clear := false.B
+      }
+      when (is_nm && c.inst.rd === 0.U) {
+        assert(!nm_ld_since_clear,
+          "NM_META_CMD register rows (rd == 0) after a scratchpad index load (rd == 2): gemmini_nm_reset() first")
+      }
+      when (f === CONFIG_CMD && cfg.cmd_type === CONFIG_EX && !cfg.set_only_strides.asBool) {
+        nm_mode := cfg.nm_sparse.asBool && cfg_is_ws && !cfg.a_transpose.asBool && !cfg.b_transpose.asBool
+      }
+      when (f === PRELOAD_CMD && nm_mode && !d_garbage) {
+        assert(nm_q =/= 0.U, "n:m sparse preload with no index tile sent: index tile must be sent before its preload")
+        nm_q := nm_q - 1.U
+        nm_in_flight := true.B
+      }
+      when (f === COMPUTE_AND_FLIP_CMD || f === COMPUTE_AND_STAY_CMD) {
+        nm_in_flight := false.B
+      }
+    }
+    // a register-path tile is complete in the same cycle its last row command is dispatched
+    when (ex_controller.io.nm_reg_tile) {
+      assert(nm_room =/= 0.U, "n:m index fifo: more than 4 index tiles ahead of their preloads")
+      nm_q := nm_q + 1.U
+    }
+
+    val ld_dispatch = unrolled_cmd.fire && is_nm && c.inst.rd === 2.U
+    nm_ld_pending := nm_ld_pending + ld_dispatch - ex_controller.io.nm_ld_completed.fire
+    // a load can sit in the reservation station as its only entry while a lone preload makes it report not busy
+    when (nm_ld_pending =/= 0.U) {
+      io.busy := true.B
     }
   }
 

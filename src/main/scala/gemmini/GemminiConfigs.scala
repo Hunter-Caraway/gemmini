@@ -116,15 +116,19 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     require(spatialArrayInputType.getWidth == spatialArrayWeightType.getWidth, "sparse mode reuses the b port for activations")
     require(isPow2(m), "keep m a power of 2 so the index is log2(m) bits")
     require(meshColumns * tileColumns * log2Up(m) <= 64, "one index row has to fit in a 64 bit reg")
+    require(ex_read_from_spad, "the n:m index loader (NM_META_CMD rd == 2) reads the scratchpad") // changed: Fix A
   }
-  val nm_n = nm_sparsity.map(_._1).getOrElse(1)
-  val nm_m = nm_sparsity.map(_._2).getOrElse(1)
-  val nm_idx_bits = log2Up(nm_m) max 1
+  val nm_idx_bits = nm_sparsity.map { case (_, m) => log2Up(m) }.getOrElse(1)
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
     case CapacityInMatrices(ms) => ms * meshRows * tileRows / sp_banks
   }
+  // changed: Fix A. one DIM x DIM index tile, packed tight (log2(m) bits per index, row-major, lowest bit first),
+  // fills this many scratchpad rows (4 for 2:4, 6 for 4:8 at DIM 16 int8). NM_META_CMD rd == 2 reads them.
+  val nm_tile_bits = (meshRows * tileRows) * (meshRows * tileRows) * nm_idx_bits
+  val nm_spad_rows_per_tile = (nm_tile_bits + sp_width - 1) / sp_width
+  val nm_meta_fifo_depth = 4 // changed: Fix A, index tiles the fifo holds (was a local in ExecuteController)
   val acc_bank_entries = acc_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (acc_banks * meshColumns * tileColumns * accType.getWidth)
     case CapacityInMatrices(ms) => ms * meshRows * tileRows / acc_banks
@@ -524,8 +528,9 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     // changed: let software know the hardware n:m pattern
     nm_sparsity.foreach { case (n, m) =>
       header ++= s"#define HAS_NM_SPARSITY\n"
-      header ++= s"#define NM_N $n\n"
-      header ++= s"#define NM_M $m\n\n"
+      header ++= s"#define GEMMINI_HW_NM_N $n\n"
+      header ++= s"#define GEMMINI_HW_NM_M $m\n"
+      header ++= s"#define GEMMINI_HW_NM_SPAD_ROWS_PER_TILE $nm_spad_rows_per_tile\n\n" // changed: Fix A
     }
 
     header ++= s"#endif // $guard\n"

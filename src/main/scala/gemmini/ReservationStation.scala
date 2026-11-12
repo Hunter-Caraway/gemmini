@@ -192,6 +192,11 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val funct = cmd.inst.funct
     val funct_is_compute = funct === COMPUTE_AND_STAY_CMD || funct === COMPUTE_AND_FLIP_CMD
     val config_cmd_type = cmd.rs1(1,0) // TODO magic numbers
+    // changed: Fix A. NM_META_CMD with rd == 2 (the only funct 26 the controller sends here) reads n index tiles,
+    // scratchpad rows [rs1, rs1 + rs2[7:0] * nm_spad_rows_per_tile). It sits in the ex queue so it waits for the mvins
+    // of those rows (raw) and later mvins wait for it (war).
+    val funct_is_nm_ld = nm_sparsity.isDefined.B && funct === NM_META_CMD
+    val nm_ld_rows = cmd.rs2(7, 0) * nm_spad_rows_per_tile.U
 
     new_entry.issued := false.B
     new_entry.cmd := io.alloc.bits
@@ -218,13 +223,16 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       new_entry.opb := op2
     }
 
-    op1.valid := funct === PRELOAD_CMD || funct_is_compute
+    op1.valid := funct === PRELOAD_CMD || funct_is_compute || funct_is_nm_ld // changed: Fix A, added nm_ld
     op1.bits.start := cmd.rs1.asTypeOf(local_addr_t)
     when (funct === PRELOAD_CMD) {
       // TODO check b_transpose here iff WS mode is enabled
       val preload_rows = cmd.rs1(48 + log2Up(block_rows + 1) - 1, 48)
       op1.bits.end := op1.bits.start + preload_rows
       op1.bits.wraps_around := op1.bits.start.add_with_overflow(preload_rows)._2
+    }.elsewhen (funct_is_nm_ld) { // changed: Fix A, the index rows
+      op1.bits.end := op1.bits.start + nm_ld_rows
+      op1.bits.wraps_around := op1.bits.start.add_with_overflow(nm_ld_rows)._2
     }.otherwise {
       val rows = cmd.rs1(48 + log2Up(block_rows + 1) - 1, 48)
       val cols = cmd.rs1(32 + log2Up(block_cols + 1) - 1, 32)
@@ -233,12 +241,14 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       op1.bits.wraps_around := op1.bits.start.add_with_overflow(compute_rows)._2
     }
 
-    op2.valid := funct_is_compute || funct === STORE_CMD || funct === STORE_SPAD_CMD
+    op2.valid := funct_is_compute || funct === STORE_CMD || funct === STORE_SPAD_CMD || funct_is_nm_ld // changed: Fix A
     op2.bits.start := cmd.rs2.asTypeOf(local_addr_t)
     when (funct_is_compute) {
       val compute_rows = cmd.rs2(48 + log2Up(block_rows + 1) - 1, 48)
       op2.bits.end := op2.bits.start + compute_rows
       op2.bits.wraps_around := op2.bits.start.add_with_overflow(compute_rows)._2
+    }.elsewhen (funct_is_nm_ld) {
+      op2.bits := op1.bits // changed: Fix A, rs2 is the tile count, so opb repeats the index rows (deps read opb.bits)
     }.elsewhen (pooling_is_enabled) {
       // If pooling is enabled, then we assume that this command simply mvouts everything in this accumulator bank from
       // start to the end of the bank // TODO this won't work when acc_banks =/= 2
@@ -311,7 +321,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     }
 
     val is_load = funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
-    val is_ex = funct === PRELOAD_CMD || funct_is_compute || (funct === CONFIG_CMD && config_cmd_type === CONFIG_EX)
+    val is_ex = funct === PRELOAD_CMD || funct_is_compute || (funct === CONFIG_CMD && config_cmd_type === CONFIG_EX) ||
+      funct_is_nm_ld // changed: Fix A
     val is_store = funct === STORE_CMD || funct === STORE_SPAD_CMD || (funct === CONFIG_CMD && (config_cmd_type === CONFIG_STORE || config_cmd_type === CONFIG_NORM))
     val is_norm = funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM // normalization commands are a subset of store commands, so they still go in the store queue
 
