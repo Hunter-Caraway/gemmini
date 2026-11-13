@@ -69,11 +69,30 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   val block_stride = block_strides(state_id)
   val pixel_repeat = pixel_repeats(state_id)
 
+  // changed: sparse-loop-fix, LOAD_IDX_CMD (funct 27) loads with constants, never with a config_ld register
+  val ld_idx = nm_sparsity.isDefined.B && cmd.bits.cmd.inst.funct === LOAD_IDX_CMD // changed: sparse-loop-fix, n:m builds only
+  // changed: sparse-loop-fix, bit pattern software sends for MVIN_SCALE_IDENTITY (scale_t_to_scale_t_bits)
+  val ld_idx_scale = if (nm_sparsity.isEmpty) 0.U else mvin_scale_args match { // changed: sparse-loop-fix, LOAD_IDX constants
+    case None => 0.U // changed: sparse-loop-fix, no mvin scaling on this chip
+    case Some(args) => args.multiplicand_t match { // changed: sparse-loop-fix, LOAD_IDX constants
+      case Float(8, 24, false) => (BigInt(java.lang.Float.floatToRawIntBits(args.identity.toFloat)) & 0xffffffffL).U // changed: sparse-loop-fix, ieee single
+      case _: UInt | _: SInt => (BigInt(args.identity) & ((BigInt(1) << mvin_scale_t_bits) - 1)).U // changed: sparse-loop-fix, integer scale
+      case t => throw new IllegalArgumentException(s"sparse-loop-fix: no LOAD_IDX identity scale for mvin scale type $t") // changed: sparse-loop-fix
+    } // changed: sparse-loop-fix, LOAD_IDX constants
+  } // changed: sparse-loop-fix, LOAD_IDX constants
+  // changed: sparse-loop-fix, the dense build keeps the plain register reads
+  def ld_sel[D <: Data](reg: D, const: D): D = if (nm_sparsity.isDefined) Mux(ld_idx, const, reg) else reg // changed: sparse-loop-fix, LOAD_IDX constants
+  val ld_stride = ld_sel(stride, (block_cols * config.inputType.getWidth / 8).U(coreMaxAddrBits.W)) // changed: sparse-loop-fix, index rows are contiguous in DRAM
+  val ld_scale = ld_sel(scale, ld_idx_scale) // changed: sparse-loop-fix, identity
+  val ld_shrink = ld_sel(shrink, false.B) // changed: sparse-loop-fix, never shrinks
+  val ld_block_stride = ld_sel(block_stride, block_rows.U(block_stride_bits.W)) // changed: sparse-loop-fix, one block only (cols == DIM)
+  val ld_pixel_repeat = ld_sel(pixel_repeat, 1.U(pixel_repeats_bits.W)) // changed: sparse-loop-fix, no pixel repeats
+
   val all_zeros = vaddr === 0.U
 
   val localaddr_plus_row_counter = localaddr + row_counter
 
-  val actual_rows_read = Mux(stride === 0.U && !all_zeros, 1.U, rows)
+  val actual_rows_read = Mux(ld_stride === 0.U && !all_zeros, 1.U, rows) // changed: sparse-loop-fix, ld_stride covers LOAD_IDX
 
   val DoConfig = cmd.bits.cmd.inst.funct === CONFIG_CMD
   val DoLoad = !DoConfig // TODO change this if more commands are added
@@ -99,16 +118,16 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   io.dma.req.valid := (control_state === waiting_for_command && cmd.valid && DoLoad && cmd_tracker.io.alloc.ready) ||
     control_state === waiting_for_dma_req_ready ||
     (control_state === sending_rows && row_counter =/= 0.U)
-  io.dma.req.bits.vaddr := vaddr + row_counter * stride
+  io.dma.req.bits.vaddr := vaddr + row_counter * ld_stride // changed: sparse-loop-fix, ld_stride covers LOAD_IDX
   io.dma.req.bits.laddr := localaddr_plus_row_counter
   io.dma.req.bits.cols := cols
-  io.dma.req.bits.repeats := Mux(stride === 0.U && !all_zeros, rows - 1.U, 0.U)
-  io.dma.req.bits.block_stride := block_stride
-  io.dma.req.bits.scale := scale
-  io.dma.req.bits.has_acc_bitwidth := localaddr_plus_row_counter.is_acc_addr && !shrink
+  io.dma.req.bits.repeats := Mux(ld_stride === 0.U && !all_zeros, rows - 1.U, 0.U) // changed: sparse-loop-fix, ld_stride covers LOAD_IDX
+  io.dma.req.bits.block_stride := ld_block_stride // changed: sparse-loop-fix, constant for LOAD_IDX
+  io.dma.req.bits.scale := ld_scale // changed: sparse-loop-fix, constant for LOAD_IDX
+  io.dma.req.bits.has_acc_bitwidth := localaddr_plus_row_counter.is_acc_addr && !ld_shrink // changed: sparse-loop-fix, constant for LOAD_IDX
   io.dma.req.bits.all_zeros := all_zeros
   io.dma.req.bits.status := mstatus
-  io.dma.req.bits.pixel_repeats := pixel_repeat
+  io.dma.req.bits.pixel_repeats := ld_pixel_repeat // changed: sparse-loop-fix, constant for LOAD_IDX
 
   // Command tracker IO
   cmd_tracker.io.alloc.valid := control_state === waiting_for_command && cmd.valid && DoLoad
@@ -133,7 +152,7 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   when (io.dma.req.fire) {
     row_counter := wrappingAdd(row_counter, 1.U, actual_rows_read)
 
-    assert(block_stride >= rows)
+    assert(ld_block_stride >= rows) // changed: sparse-loop-fix, checks the stride the load really uses
   }
 
   // Control logic

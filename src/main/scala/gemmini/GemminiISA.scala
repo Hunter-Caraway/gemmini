@@ -39,6 +39,8 @@ object GemminiISA {
   val LOOP_WS_CONFIG_SPAD_C = 25.U
 
   val NM_META_CMD = 26.U // changed: added, stages n:m index rows for the next sparse preload
+  val LOAD_IDX_CMD = 27.U // changed: sparse-loop-fix, mvin of n:m index rows with a fixed load config
+  val LOOP_WS_CONFIG_NM = 28.U // changed: sparse-loop-fix, index DRAM address of a sparse LOOP_WS
 
   // rs1[2:0] values
   val CONFIG_EX = 0.U

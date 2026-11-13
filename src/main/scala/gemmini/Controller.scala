@@ -259,27 +259,58 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs) }
   else (raw_cmd, false.B)
 
-  val (loop_cmd, loop_matmul_unroller_busy, loop_completed) = withClock (gated_clock) { LoopMatmul(if (has_loop_conv) conv_cmd else raw_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+  val (loop_cmd, loop_matmul_unroller_busy, loop_completed, nm_loop_first_load) = withClock (gated_clock) { LoopMatmul(if (has_loop_conv) conv_cmd else raw_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed, // changed: sparse-loop-fix, nm_loop_first_load
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
-    new MvoutSpadRs1(32, local_addr_t), new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t)) }
+    new MvoutSpadRs1(32, local_addr_t), new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t), // changed: sparse-loop-fix, n:m builds only
+    if (nm_sparsity.isDefined) nm_spad_rows_per_tile else 0, sp_bank_entries) } // changed: sparse-loop-fix, sparse loop hardware only on n:m builds
 
   val unrolled_cmd = Queue(loop_cmd)
   unrolled_cmd.ready := false.B
+  // changed: sparse-loop-fix, carries the first-LOAD flag next to the command queue above (same depth, same enq and deq)
+  val unrolled_nm_first_load = nm_loop_first_load.map { first => // changed: sparse-loop-fix, first-LOAD flag follows its command
+    val q = Module(new Queue(Bool(), 2)) // changed: sparse-loop-fix, first-LOAD flag follows its command
+    q.io.enq.valid := loop_cmd.fire // changed: sparse-loop-fix, first-LOAD flag follows its command
+    q.io.enq.bits := first // changed: sparse-loop-fix, first-LOAD flag follows its command
+    q.io.deq.ready := unrolled_cmd.fire // changed: sparse-loop-fix, first-LOAD flag follows its command
+    q.io.deq.bits // changed: sparse-loop-fix, first-LOAD flag follows its command
+  } // changed: sparse-loop-fix, first-LOAD flag follows its command
 
   // changed: LOOP_WS / LOOP_CONV_WS are illegal in sparse mode; track rs1[10] of the last full config_ex in program order
   if (nm_sparsity.isDefined) {
     val nm_loop_sparse = RegInit(false.B)
     val rc_funct = raw_cmd.bits.cmd.inst.funct
     val rc_cfg = raw_cmd.bits.cmd.rs1.asTypeOf(new ConfigExRs1(acc_scale_t_bits))
+    val rc_rs1 = raw_cmd.bits.cmd.rs1 // changed: sparse-loop-fix
+    val rc_rs2 = raw_cmd.bits.cmd.rs2 // changed: sparse-loop-fix
+    val nm_cfg_seen = RegInit(false.B) // changed: sparse-loop-fix, LOOP_WS_CONFIG_NM seen since the last LOOP_WS
+    val nm_a_stride = RegInit(0.U(16.W)) // changed: sparse-loop-fix, a_stride of the last config_ex in program order (N8)
     when (raw_cmd.fire) {
       when (rc_funct === CONFIG_CMD && rc_cfg.cmd_type === CONFIG_EX && !rc_cfg.set_only_strides.asBool) {
         nm_loop_sparse := rc_cfg.nm_sparse.asBool
       }
-      assert(!(nm_loop_sparse && (rc_funct === LOOP_WS || rc_funct === LOOP_CONV_WS)),
-        "LOOP_WS / LOOP_CONV_WS issued while n:m sparse mode (config_ex rs1[10]) is on")
+      when (rc_funct === CONFIG_CMD && rc_cfg.cmd_type === CONFIG_EX) { // changed: sparse-loop-fix, strides are taken from every config_ex
+        nm_a_stride := rc_cfg.a_stride // changed: sparse-loop-fix
+      } // changed: sparse-loop-fix
+      // changed: sparse-loop-fix, a sparse LOOP_WS (rs1[3]) is legal in sparse mode only, a dense one in dense mode only
+      assert(!(rc_funct === LOOP_WS && rc_rs1(3) =/= nm_loop_sparse), // changed: sparse-loop-fix, sparse loop legality checks in program order
+        "sparse-loop-fix: LOOP_WS nm flag (rs1[3]) differs from n:m sparse mode (config_ex rs1[10])") // changed: sparse-loop-fix, sparse loop legality checks in program order
+      assert(!(nm_loop_sparse && rc_funct === LOOP_CONV_WS), // changed: sparse-loop-fix, the LOOP_CONV_WS half of the old check
+        "sparse-loop-fix: LOOP_CONV_WS issued while n:m sparse mode (config_ex rs1[10]) is on") // changed: sparse-loop-fix, sparse loop legality checks in program order
+      // changed: sparse-loop-fix, the lines below up to the end of this when are new: LOOP_WS_CONFIG_NM and LOOP_WS rs1[3] go together
+      when (rc_funct === LOOP_WS_CONFIG_NM) { // changed: sparse-loop-fix, sparse loop legality checks in program order
+        nm_cfg_seen := true.B // changed: sparse-loop-fix, sparse loop legality checks in program order
+        assert(rc_rs1 =/= 0.U && rc_rs1(3, 0) === 0.U && rc_rs2 === 0.U, // changed: sparse-loop-fix, sparse loop legality checks in program order
+          "sparse-loop-fix: LOOP_WS_CONFIG_NM needs a non-zero 16-byte aligned rs1 and rs2 == 0") // changed: sparse-loop-fix, sparse loop legality checks in program order
+      } // changed: sparse-loop-fix, sparse loop legality checks in program order
+      when (rc_funct === LOOP_WS) { // changed: sparse-loop-fix, sparse loop legality checks in program order
+        nm_cfg_seen := false.B // changed: sparse-loop-fix, sparse loop legality checks in program order
+        assert(!(rc_rs1(3) && !nm_cfg_seen), "sparse-loop-fix: LOOP_WS with rs1[3] set needs LOOP_WS_CONFIG_NM (funct 28) first") // changed: sparse-loop-fix, sparse loop legality checks in program order
+        assert(!(!rc_rs1(3) && nm_cfg_seen), "sparse-loop-fix: LOOP_WS_CONFIG_NM (funct 28) without LOOP_WS rs1[3]") // changed: sparse-loop-fix, sparse loop legality checks in program order
+        assert(!(rc_rs1(3) && nm_a_stride =/= 1.U), "sparse-loop-fix: sparse loop needs A_stride == 1") // changed: sparse-loop-fix, sparse loop legality checks in program order
+      } // changed: sparse-loop-fix, sparse loop legality checks in program order
     }
   }
   counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
@@ -566,6 +597,22 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     }
   }
 
+  // changed: sparse-loop-fix, LOAD_IDX (funct 27) is an ordinary load-queue command (dispatched by the default branch
+  // changed: sparse-loop-fix, above); its operands are checked here. A dense build has no funct 27 and gets no check.
+  if (nm_sparsity.isDefined) { // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    val li_rs2 = unrolled_cmd.bits.cmd.rs2 // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    val li_rows = li_rs2(63, 48) // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    val li_cols = li_rs2(47, 32) // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    val li_sp_rows = sp_banks * sp_bank_entries // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    when (unrolled_cmd.fire && unrolled_cmd.bits.cmd.inst.funct === LOAD_IDX_CMD) { // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+      assert(li_cols === (meshColumns * tileColumns).U && li_rows =/= 0.U && li_rows <= (meshRows * tileRows).U, // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+        "sparse-loop-fix: LOAD_IDX needs cols == 16 and 1..16 rows") // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+      // changed: sparse-loop-fix, the last row written (address + rows - 1) must exist; +& keeps the carry so a large address cannot wrap
+      assert(li_rs2(31, log2Ceil(li_sp_rows)) === 0.U && (li_rs2(31, 0) +& li_rows) <= li_sp_rows.U, // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+        "sparse-loop-fix: LOAD_IDX destination must be a scratchpad row address") // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+    } // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+  } // changed: sparse-loop-fix, LOAD_IDX operand checks, n:m builds only
+
   // changed: index fifo deadlock check. While index rows are blocked, any preload that could pop the fifo sits in the
   // RS with its compute (2+ entries, busy), so a blocked fifo with a non-busy RS can never drain.
   if (nm_sparsity.isDefined) {
@@ -601,6 +648,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
     when (unrolled_cmd.fire) {
       when (is_nm && c.inst.rd === 2.U) {
+        // changed: sparse-loop-fix, the first LOAD of a sparse loop must find the index fifo empty (tiles left from before would be popped by its preloads)
+        unrolled_nm_first_load.foreach { first => // changed: sparse-loop-fix
+          assert(!(first && (nm_q =/= 0.U || nm_in_flight)), // changed: sparse-loop-fix
+            "sparse-loop-fix: sparse loop started with index tiles pending in the FIFO: gemmini_nm_reset() first") // changed: sparse-loop-fix
+        } // changed: sparse-loop-fix
         assert(ld_n >= 1.U && ld_n <= nm_meta_fifo_depth.U, "NM_META_CMD rd == 2: tile count rs2[7:0] must be 1..4")
         assert(c.rs1(63, 32) === 0.U && c.rs2(63, 8) === 0.U, "NM_META_CMD rd == 2: rs1[63:32] and rs2[63:8] must be 0")
         assert(c.rs1(31, sp_addr_bits) === 0.U,

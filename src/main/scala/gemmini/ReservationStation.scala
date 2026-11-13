@@ -197,6 +197,7 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     // of those rows (raw) and later mvins wait for it (war).
     val funct_is_nm_ld = nm_sparsity.isDefined.B && funct === NM_META_CMD
     val nm_ld_rows = cmd.rs2(7, 0) * nm_spad_rows_per_tile.U
+    val funct_is_ld_idx = nm_sparsity.isDefined.B && funct === LOAD_IDX_CMD // changed: sparse-loop-fix, mvin of index rows, n:m builds only
 
     new_entry.issued := false.B
     new_entry.cmd := io.alloc.bits
@@ -274,7 +275,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     }
 
     dst.valid := funct === PRELOAD_CMD || funct === STORE_SPAD_CMD ||
-      funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD
+      funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || // changed: sparse-loop-fix, LOAD_IDX is a load
+      funct_is_ld_idx // changed: sparse-loop-fix, LOAD_IDX writes rows rs2[31:0] .. + rows like any mvin
     dst.bits.start := cmd.rs2(31, 0).asTypeOf(local_addr_t)
     when (funct === PRELOAD_CMD) {
       val preload_rows = cmd.rs2(48 + log2Up(block_rows + 1) - 1, 48) * c_stride
@@ -295,8 +297,9 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     }.otherwise {
       val id = MuxCase(0.U, Seq((new_entry.cmd.cmd.inst.funct === LOAD2_CMD) -> 1.U,
         (new_entry.cmd.cmd.inst.funct === LOAD3_CMD) -> 2.U))
-      val block_stride = ld_block_strides(id)
-      val pixel_repeats = ld_pixel_repeats(id)
+      // changed: sparse-loop-fix, LOAD_IDX has no config_ld id: block stride DIM, no pixel repeats (stored minus one)
+      val block_stride = if (nm_sparsity.isDefined) Mux(funct_is_ld_idx, block_rows.U, ld_block_strides(id)) else ld_block_strides(id) // changed: sparse-loop-fix, LOAD_IDX is a load
+      val pixel_repeats = if (nm_sparsity.isDefined) Mux(funct_is_ld_idx, 0.U, ld_pixel_repeats(id)) else ld_pixel_repeats(id) // changed: sparse-loop-fix
 
       val mvin_cols = cmd.rs2(32 + mvin_cols_bits - 1, 32)
       val mvin_rows = cmd.rs2(48 + mvin_rows_bits - 1, 48)
@@ -320,7 +323,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       dst.bits.wraps_around := dst.bits.start.add_with_overflow(total_mvin_rows)._2
     }
 
-    val is_load = funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
+    val is_load = funct === LOAD_CMD || funct === LOAD2_CMD || funct === LOAD3_CMD || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD) || // changed: sparse-loop-fix, LOAD_IDX is a load
+      funct_is_ld_idx // changed: sparse-loop-fix, LOAD_IDX is a load-queue command
     val is_ex = funct === PRELOAD_CMD || funct_is_compute || (funct === CONFIG_CMD && config_cmd_type === CONFIG_EX) ||
       funct_is_nm_ld // changed: Fix A
     val is_store = funct === STORE_CMD || funct === STORE_SPAD_CMD || (funct === CONFIG_CMD && (config_cmd_type === CONFIG_STORE || config_cmd_type === CONFIG_NORM))
