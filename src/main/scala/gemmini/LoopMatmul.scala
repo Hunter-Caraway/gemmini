@@ -1368,7 +1368,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
           assert(!(cmd.bits.cmd.rs2(0) || cmd.bits.cmd.rs2(1) || cmd.bits.cmd.rs2(2) || cmd.bits.cmd.rs1(2) || cmd.bits.cmd.rs2(9)), // changed: sparse-loop-fix, sparse loop config decode is new
             "sparse-loop-fix: sparse loop does not support transposes, resadd, low_D or spad-only") // changed: sparse-loop-fix, sparse loop config decode is new
           assert(!l.max_k(0) && l.pad_k === 0.U, // changed: sparse-loop-fix, sparse loop config decode is new
-            "sparse-loop-fix: sparse loop needs an even K tile count and pad_K == 0 (K % 2*DIM)") // changed: sparse-loop-fix, sparse loop config decode is new
+            "sparse-loop-fix: sparse loop needs an even K tile count and pad_K == 0 (K %% 2*DIM)") // changed: sparse-loop-fix, sparse loop config decode is new
           assert((a_rows +& b_rows +& idx_rows) <= (max_addr / concurrent_loops).U && idx_rows <= nm_bank_rows.U, // changed: sparse-loop-fix, sparse loop config decode is new
             "sparse-loop-fix: A, B and index regions do not fit in the loop's scratchpad half (or index region exceeds one bank)") // changed: sparse-loop-fix, sparse loop config decode is new
         } // changed: sparse-loop-fix, sparse loop config decode is new
